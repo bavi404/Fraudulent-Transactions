@@ -1,0 +1,400 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Enhanced Fraud Detection Pipeline with Multi-AZ, Auto-scaling, and Security"
+
+Parameters:
+  Environment:
+    Type: String
+    Default: "production"
+    AllowedValues: ["development", "staging", "production"]
+    Description: "Environment name"
+  
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: "VPC ID for the EMR cluster"
+  
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: "List of subnet IDs for multi-AZ deployment"
+  
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: "EC2 Key Pair for SSH access"
+
+Resources:
+  # Enhanced EMR Cluster with Multi-AZ
+  EnhancedEMRCluster:
+    Type: AWS::EMR::Cluster
+    Properties:
+      Name: !Sub "FraudDetection-${Environment}-${AWS::StackName}"
+      ReleaseLabel: emr-7.0.0
+      Applications:
+        - Name: Spark
+        - Name: Hive
+        - Name: Hue
+      Instances:
+        MasterInstanceGroup:
+          InstanceCount: 3  # Multi-master for high availability
+          InstanceType: m5.2xlarge
+          Name: MASTER
+          Market: ON_DEMAND
+        CoreInstanceGroup:
+          InstanceCount: 4
+          InstanceType: m5.2xlarge
+          Name: CORE
+          Market: ON_DEMAND
+          AutoScalingPolicy:
+            MinInstances: 2
+            MaxInstances: 10
+            Rules:
+              - Name: ScaleUp
+                Action:
+                  SimpleScalingPolicyConfiguration:
+                    AdjustmentType: CHANGE_IN_CAPACITY
+                    ScalingAdjustment: 1
+                    CoolDown: 300
+                Trigger:
+                  CloudWatchAlarm:
+                    ComparisonOperator: GREATER_THAN
+                    EvaluationPeriods: 2
+                    MetricName: YARNMemoryAvailablePercentage
+                    Namespace: AWS/ElasticMapReduce
+                    Period: 300
+                    Statistic: AVERAGE
+                    Threshold: 20
+              - Name: ScaleDown
+                Action:
+                  SimpleScalingPolicyConfiguration:
+                    AdjustmentType: CHANGE_IN_CAPACITY
+                    ScalingAdjustment: -1
+                    CoolDown: 300
+                Trigger:
+                  CloudWatchAlarm:
+                    ComparisonOperator: LESS_THAN
+                    EvaluationPeriods: 2
+                    MetricName: YARNMemoryAvailablePercentage
+                    Namespace: AWS/ElasticMapReduce
+                    Period: 300
+                    Statistic: AVERAGE
+                    Threshold: 80
+        Ec2SubnetIds: !Ref SubnetIds
+        Ec2KeyName: !Ref KeyName
+        KeepJobFlowAliveWhenNoSteps: true
+      JobFlowRole: !GetAtt EMREC2Role.Arn
+      ServiceRole: !GetAtt EMRServiceRole.Arn
+      LogUri: !Sub "s3://${LoggingBucket}/emr-logs/"
+      BootstrapActions:
+        - Name: "Install Dependencies"
+          ScriptBootstrapAction:
+            Path: !Sub "s3://${BootstrapBucket}/bootstrap.sh"
+      Configurations:
+        - Classification: "spark-defaults"
+          Properties:
+            "spark.executor.memory": "8g"
+            "spark.executor.cores": "4"
+            "spark.sql.adaptive.enabled": "true"
+            "spark.sql.adaptive.coalescePartitions.enabled": "true"
+            "spark.sql.adaptive.skewJoin.enabled": "true"
+            "spark.serializer": "org.apache.spark.serializer.KryoSerializer"
+        - Classification: "hadoop-env"
+          Properties:
+            "HADOOP_OPTS": "-Xmx4g"
+        - Classification: "spark-env"
+          Properties:
+            "SPARK_DRIVER_MEMORY": "4g"
+            "SPARK_EXECUTOR_MEMORY": "8g"
+
+  # Enhanced Spark Step with ML Support
+  EnhancedSparkStep:
+    Type: AWS::EMR::Step
+    Properties:
+      Name: "EnhancedFraudDetection"
+      ActionOnFailure: CONTINUE
+      HadoopJarStep:
+        Jar: command-runner.jar
+        Args:
+          - spark-submit
+          - --deploy-mode
+          - cluster
+          - --class
+          - org.apache.spark.deploy.FraudDetectionApp
+          - --packages
+          - org.apache.spark:spark-sql-kafka-0-10_2.12:3.2.1,io.delta:delta-core_2.12:2.4.0
+          - --jars
+          - s3://${ArtifactsBucket}/mysql-connector-java-8.0.23.jar
+          - --conf
+          - spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension
+          - --conf
+          - spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog
+          - s3://${ArtifactsBucket}/enhanced-fraud-detection.py
+      JobFlowId: !Ref EnhancedEMRCluster
+
+  # Enhanced Glue Crawler with Delta Lake Support
+  EnhancedDataCrawler:
+    Type: AWS::Glue::Crawler
+    DependsOn:
+      - EnhancedEMRCluster
+      - EnhancedSparkStep
+    Properties:
+      Name: !Sub "enhanced-data-crawler-${Environment}"
+      DatabaseName: !Ref GlueDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub "s3://${DataBucket}/delta_table/"
+          - Path: !Sub "s3://${DataBucket}/processed_data/"
+      Role: !GetAtt GlueServiceRole.Arn
+      Schedule: cron(0 */2 * * ? *)  # Run every 2 hours
+      Configuration: |
+        {
+          "Version": 1.0,
+          "CrawlerOutput": {
+            "Partitions": {
+              "AddOrUpdateBehavior": "InheritFromTable"
+            }
+          }
+        }
+
+  # Glue Database
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      Name: !Sub "fraud_detection_${Environment}"
+      Description: "Database for fraud detection pipeline"
+
+  # S3 Buckets
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "fraud-detection-data-${AWS::AccountId}-${Environment}"
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: "DataRetention"
+            Status: Enabled
+            ExpirationInDays: 2555  # 7 years
+            Transitions:
+              - StorageClass: INTELLIGENT_TIERING
+                TransitionInDays: 30
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Encryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  LoggingBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "fraud-detection-logs-${AWS::AccountId}-${Environment}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "fraud-detection-artifacts-${AWS::AccountId}-${Environment}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  BootstrapBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "fraud-detection-bootstrap-${AWS::AccountId}-${Environment}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # IAM Roles
+  EMREC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "EMREC2Role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonElasticMapReduceforEC2Role
+      Policies:
+        - PolicyName: "S3Access"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::${DataBucket}/*"
+                  - !Sub "arn:aws:s3:::${DataBucket}"
+                  - !Sub "arn:aws:s3:::${LoggingBucket}/*"
+                  - !Sub "arn:aws:s3:::${LoggingBucket}"
+                  - !Sub "arn:aws:s3:::${ArtifactsBucket}/*"
+                  - !Sub "arn:aws:s3:::${ArtifactsBucket}"
+
+  EMRServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "EMRServiceRole-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: elasticmapreduce.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonElasticMapReduceRole
+
+  GlueServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "GlueServiceRole-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: "S3Access"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::${DataBucket}/*"
+                  - !Sub "arn:aws:s3:::${DataBucket}"
+
+  # CloudWatch Dashboard
+  FraudDetectionDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "FraudDetection-${Environment}"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/ElasticMapReduce", "AppsRunning", "JobFlowId", "${EnhancedEMRCluster}"],
+                  [".", "AppsSucceeded", ".", "."],
+                  [".", "AppsFailed", ".", "."]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "EMR Applications Status"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/ElasticMapReduce", "YARNMemoryAvailablePercentage", "JobFlowId", "${EnhancedEMRCluster}"],
+                  [".", "YARNMemoryAllocatedPercentage", ".", "."]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "YARN Memory Usage"
+              }
+            }
+          ]
+        }
+
+  # SNS Topic for Alerts
+  FraudAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "fraud-alerts-${Environment}"
+      DisplayName: !Sub "Fraud Detection Alerts - ${Environment}"
+
+  # Lambda Function for Processing Alerts
+  AlertProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "fraud-alert-processor-${Environment}"
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          
+          def lambda_handler(event, context):
+              # Process fraud alerts
+              print(f"Processing alert: {json.dumps(event)}")
+              return {"statusCode": 200, "body": "Alert processed"}
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "LambdaExecutionRole-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+Outputs:
+  EMRClusterId:
+    Description: "EMR Cluster ID"
+    Value: !Ref EnhancedEMRCluster
+    Export:
+      Name: !Sub "${AWS::StackName}-EMRClusterId"
+  
+  DataBucketName:
+    Description: "S3 Bucket for processed data"
+    Value: !Ref DataBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-DataBucket"
+  
+  GlueDatabaseName:
+    Description: "Glue Database name"
+    Value: !Ref GlueDatabase
+    Export:
+      Name: !Sub "${AWS::StackName}-GlueDatabase"
+  
+  SNSTopicArn:
+    Description: "SNS Topic for fraud alerts"
+    Value: !Ref FraudAlertsTopic
+    Export:
+      Name: !Sub "${AWS::StackName}-SNSTopic"
+

@@ -1,0 +1,68 @@
+# Optimized Spark Configuration for Fraud Detection Pipeline
+spark:
+  # Memory and CPU optimization
+  executor:
+    memory: 8g
+    cores: 4
+    memoryOverhead: 2g
+    maxMemory: 6g
+  
+  # Driver configuration
+  driver:
+    memory: 4g
+    maxResultSize: 2g
+  
+  # Performance tuning
+  sql:
+    adaptive:
+      enabled: true
+      coalescePartitions:
+        enabled: true
+        minPartitionNum: 1
+        initialPartitionNum: 200
+      skewJoin:
+        enabled: true
+        skewThreshold: 256
+        skewPartitionThreshold: 1000000
+      localShuffleReader:
+        enabled: true
+  
+  # Streaming optimization
+  streaming:
+    backpressure:
+      enabled: true
+      initialRate: 1000
+    kafka:
+      maxOffsetsPerTrigger: 10000
+  
+  # Serialization
+  serializer: org.apache.spark.serializer.KryoSerializer
+  kryo:
+    registrationRequired: false
+    unsafe: true
+  
+  # Shuffle optimization
+  shuffle:
+    file:
+      buffer: 32k
+    spill:
+      compress: true
+    io:
+      maxRetries: 3
+  
+  # Network configuration
+  network:
+    timeout: 800s
+    io:
+      maxRetries: 3
+      retryWait: 5s
+  
+  # Dynamic allocation
+  dynamicAllocation:
+    enabled: true
+    minExecutors: 2
+    maxExecutors: 20
+    initialExecutors: 4
+    executorIdleTimeout: 60s
+    cachedExecutorIdleTimeout: 120s
+
