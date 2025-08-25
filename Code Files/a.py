@@ -84,7 +84,7 @@ df = kafka_stream.selectExpr("CAST(key AS STRING)", "CAST(value AS STRING)") \
 jdbc_url = "jdbc:mysql://grouptwo.cq7tmru9zell.us-east-1.rds.amazonaws.com/customer"
 connection_properties = {
     "user": "admin",
-    "password": "Group_two",
+    "password": "",
     "driver": "com.mysql.jdbc.Driver"
 }
 rds_df = spark.read.jdbc(jdbc_url, table="customer_details", properties=connection_properties)
